@@ -23,6 +23,45 @@ configs = [
 ]
 
 
+@pytest.mark.parametrize("columns", [511, 512, 513, 516, 537, 538, 539, 540, 1024])
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_softmax_wide_row_boundaries(columns, noncontiguous):
+    """Exercise the vector-width boundary, out variant, streams and autograd."""
+    cpu = torch.sin(torch.arange(32 * columns).reshape(32, columns).float()) * 0.5
+    cpu[:, columns // 2 :] = -10000.0
+    if noncontiguous:
+        cpu = cpu.t().contiguous().t()
+    cpu.requires_grad_(True)
+    x = cpu.detach().to("musa").requires_grad_(True)
+    stream = torch.musa.Stream()
+    stream.wait_stream(torch.musa.current_stream())
+    with torch.musa.stream(stream):
+        actual = torch.softmax(x, -1)
+        out = torch.empty_like(actual)
+        returned = torch.softmax(x.detach(), 1, out=out)
+        grad_cpu = torch.sin(torch.arange(cpu.numel()).reshape_as(cpu).float())
+        actual.backward(grad_cpu.to("musa"))
+    stream.synchronize()
+    expected = torch.softmax(cpu, -1)
+    expected.backward(grad_cpu)
+    torch.testing.assert_close(actual.cpu(), expected, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(x.grad.cpu(), cpu.grad, atol=1e-6, rtol=1e-5)
+    assert returned.data_ptr() == out.data_ptr()
+
+
+def test_softmax_unaligned_masked_rows_repeated():
+    """A single invocation rarely exposes the muDNN 3.3.0 mp_31 failure."""
+    columns = 537
+    cpu = torch.sin(torch.arange(8128 * columns).reshape(8128, columns).float()) * 0.5
+    cpu[:, 256:] = -10000.0
+    expected = torch.softmax(cpu, -1).to("musa")
+    x = cpu.to("musa")
+    for _ in range(3000):
+        actual = torch.softmax(x, -1)
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
 @testing.test_on_nonzero_card_if_multiple_musa_device(1)
 @pytest.mark.parametrize("config", configs)
 @pytest.mark.parametrize("functor", [torch.nn.Softmax, torch.nn.LogSoftmax])

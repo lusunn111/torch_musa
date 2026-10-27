@@ -5,14 +5,17 @@
 #include <ATen/TensorUtils.h>
 #include <ATen/WrapDimUtils.h>
 #include <ATen/native/ReduceOpsUtils.h>
+#include <ATen/ops/_softmax_native.h>
 #include <torch/library.h>
 
 #include "torch_musa/csrc/aten/mudnn/Softmax.h"
+#include "torch_musa/csrc/aten/musa/MUSAContext.h"
 #include "torch_musa/csrc/aten/ops/TensorFactory.h"
 #include "torch_musa/csrc/aten/utils/MudnnUtils.h"
 #include "torch_musa/csrc/aten/utils/Utils.h"
 
 #include <mudnn.h>
+#include <mudnn_version.h>
 
 namespace at {
 namespace musa {
@@ -20,21 +23,47 @@ using SOFTMAX_MODE = ::musa::dnn::Softmax::Mode;
 
 const char* H2FMsg = "softmax with half to float conversion is not supported!";
 
+namespace {
+// Reuse the ATen kernel already compiled for MUSA in libmusa_kernels.
+// This adapter supplies the output of the structured implementation directly.
+struct NativeSoftmaxOut : at::native::structured_softmax_cuda_out {
+  explicit NativeSoftmaxOut(const Tensor& output) : output_(output) {}
+  const Tensor& maybe_get_output(int64_t index) override {
+    TORCH_INTERNAL_ASSERT(index == 0);
+    return output_;
+  }
+
+ private:
+  const Tensor& output_;
+};
+} // namespace
+
 void SoftMaxCall(
     Tensor& output,
     const int64_t dim,
     const Tensor& input,
     SOFTMAX_MODE mode) {
   c10::musa::MUSAGuard device_guard(input.device());
+  const auto normalized_dim = maybe_wrap_dim(dim, input.dim());
+#if defined(MUDNN_VERSION) && MUDNN_VERSION == 3300
+  // muDNN 3.3.0 on mp_31 can intermittently corrupt FP32 probabilities in
+  // wide rows whose length is not divisible by four. A standalone muDNN
+  // C-API reproducer also exhibits the error. Avoid that kernel variant;
+  // the internal vendor-kernel defect has not been established.
+  if (mode == SOFTMAX_MODE::SOFTMAX && input.scalar_type() == kFloat &&
+      input.dim() > 0 && normalized_dim == input.dim() - 1 &&
+      input.size(-1) > 512 && input.size(-1) % 4 != 0 && input.numel() > 0 &&
+      at::musa::getMUSAArch() == 310) {
+    NativeSoftmaxOut native(output);
+    native.impl(input, normalized_dim, false, output);
+    return;
+  }
+#endif
   muHandle& h = GetMudnnHandle();
   ::musa::dnn::Softmax softmax;
   auto input_m = CreateMUTensor(input);
   auto output_m = CreateMUTensor(output);
-  int64_t _dim = dim;
-  if (_dim < 0) {
-    _dim += input.dim();
-  }
-  ::at::musa::SetSoftmax(softmax, mode, static_cast<int>(_dim));
+  ::at::musa::SetSoftmax(softmax, mode, static_cast<int>(normalized_dim));
   CHECK_MUDNN_STATUS(softmax.Run(h, output_m, input_m), "Run");
 }
 
